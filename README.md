@@ -1,99 +1,79 @@
-# ESP32 Vehicle Data Logger
+# ESP32 Flash Memory Writer/Reader
 
-This project implements a vehicle data logging system using an ESP32 microcontroller and a W25Q32JVSSIQ Flash memory chip. The system captures comprehensive vehicle telemetry data and stores it in external flash memory, with both serial and Bluetooth interfaces for control and data retrieval.
+This project implements a flash memory testing and data logging system using an ESP32 microcontroller and external SPI flash memory. The system provides continuous writing capabilities with real-time monitoring and control through both serial and Bluetooth interfaces.
 
 ## Hardware Requirements
 
 - ESP32 Development Board
-- W25Q32JVSSIQ Flash Memory Chip (32Mbit/4MB)
+- SPI Flash Memory Chip (32Mbit/4MB)
 - SPI Connection Setup:
-  - CS: GPIO 26
-  - MISO: GPIO 12
-  - CLK: GPIO 14
-  - MOSI: GPIO 13
+  - CS: GPIO 5
+  - MISO: GPIO 19
+  - CLK: GPIO 18
+  - MOSI: GPIO 23
 
 ## Features
 
-### Data Logging
-- Captures comprehensive vehicle telemetry including:
-  - Odometer and trip readings
-  - Speed and RPM
-  - Battery management system (BMS) data
-  - Temperature readings (controller and motor)
-  - Vehicle status indicators
-  - Switch states (kickstand, killswitch, etc.)
-  - Voltage and current measurements
-  - Error states
+### Features
 
-### Storage Management
-- Implements a ring buffer system in flash memory
-- 4MB total storage capacity
-- 256-byte pages for individual data entries
-- 4KB sector size for efficient memory management
-- Automatic sector erasing before writing new data
+#### Storage Management
+- 4MB total storage capacity (32Mbit)
+- 256-byte page size for efficient writing
+- 4KB sector size for memory management
+- Automatic sector erasing before writing
+- Circular buffer implementation for continuous writing
+- Built-in chip erase functionality
 
-### Communication Interfaces
+#### Data Writing
+- Continuous automated writing with address tracking
+- Page-level writing with address stamping
+- Automatic sector management
+- Configurable write timing
 
-#### Serial Interface
+#### Communication Interfaces
+
+##### Serial Interface
 - Baud Rate: 115200
-- Commands:
-  - '0': Switch to write mode
-  - '1': Switch to read mode
+- Debug output and status messages
 
-#### Bluetooth Interface
-- Device Name: "ESP32_Vehicle_Logger"
-- Commands:
-  - '1': Dump all logged vehicle data
-  - '0': Abort dump operation
+##### Bluetooth Interface
+- Device Name: "ESP32_Flash_Writer"
+- Interactive Command System:
+  - `dump`: Show last 5 pages of written data
+  - `dumpall`: Dump entire flash memory content
+  - `dumpadd [address] [length]`: Dump specific memory range
+  - `status`: Show current write position and status
+  - `erase`: Perform full chip erase
+  - `help`: Display available commands
 
 ### Real-time Operation
 - Utilizes FreeRTOS for concurrent operations
 - Separate tasks for:
   - Writing data (Core 0)
-  - Reading data (Core 1)
-  - Bluetooth data dumping
+  - Bluetooth command handling (Core 1)
 - Mutex-protected SPI access for thread safety
+- Pausable write operations for data reading
 
-## Data Structure
-The system logs the following vehicle parameters:
-```
-- odometerKm                    (float)
-- tripKm                        (float)
-- speedKmh                      (float)
-- isInReverseMode              (bool)
-- ridingMode                    (uint8_t)
-- busCurrent                    (float)
-- bmsCurrent                    (float)
-- vehicleStatusBytes           (2x uint8_t)
-- throttle                      (float)
-- controllerTemperature        (float)
-- motorTemperature             (float)
-- bmsVoltage                   (float)
-- bmsCellVoltages             (highest/lowest, float)
-- soc                          (State of Charge, uint8_t)
-- rpm                          (uint16_t)
-- boardSupplyVoltage           (float)
-- chargerVoltage               (float)
-- chargerCurrent               (float)
-- errorStates                  (count and sum)
-- Various switch states        (bool)
-```
+## Data Format
+The system writes test data in pages with the following format:
+- Each page is 256 bytes
+- Address information is embedded every 4 bytes
+- Data is viewable in both hex and ASCII formats via Bluetooth interface
+- Sequential pattern for data verification
 
 ## Operation Modes
 
-### Write Mode
-- Automatically writes vehicle data every 500ms
-- Implements circular buffer for continuous logging
+### Continuous Write Mode
+- Automatically writes test data every 500ms
+- Implements circular buffer for continuous writing
 - Automatically manages sector erasure
+- Embeds address information in data for verification
 
-### Read Mode
-- Reads stored data every 2 seconds
-- Displays formatted data via Serial interface
-
-### Bluetooth Dump Mode
-- Reads and transmits all stored data
-- Can be interrupted with abort command
-- Provides progress updates and entry counts
+### Interactive Mode (via Bluetooth)
+- Real-time monitoring of write operations
+- On-demand memory dumps with hex and ASCII view
+- Status reporting and chip management
+- Pausable write operations for safe reading
 
 ## Building and Flashing
 
@@ -106,15 +86,20 @@ This project is built using PlatformIO with the ESP32 platform. To build and fla
 ## Usage
 
 1. Power up the system
-2. Connect via Serial Monitor (115200 baud) or Bluetooth
-3. Use command interface to control operation:
-   - Serial: '0'/'1' for write/read modes
-   - Bluetooth: '1' to dump all data, '0' to abort dump
+2. Connect via Bluetooth (device name: "ESP32_Flash_Writer")
+3. Available commands:
+   - `dump`: View last 5 pages of written data
+   - `dumpall`: View entire flash memory content
+   - `dumpadd 0xADDRESS LENGTH`: View specific memory range
+   - `status`: Check current write position and status
+   - `erase`: Perform complete chip erase
+   - `help`: Show all available commands
 
 ## Implementation Notes
 
-- The system uses FreeRTOS tasks for concurrent operation
-- SPI access is protected by mutex for thread safety
-- Flash memory operations include proper error checking
-- Data is stored in CSV format for easy parsing
-- Bluetooth interface provides human-readable formatted output
+- FreeRTOS tasks handle concurrent operations
+- Mutex-protected SPI access ensures thread safety
+- Automatic sector management for reliable writing
+- Built-in data verification through address embedding
+- Comprehensive error checking and status reporting
+- Human-readable output format with hex and ASCII views

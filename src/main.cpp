@@ -206,6 +206,20 @@ void processCommand(String command) {
     pauseWriting = false;
     SerialBT.println("Resuming write operations from address 0x" + String(currentAddress, HEX));
   }
+  else if (command == "dumpall") {
+    // Pause writing and dump entire flash memory content
+    pauseWriting = true;
+    SerialBT.println("Pausing write operations and dumping all data...");
+    
+    // Wait a moment to ensure write task is paused
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    SerialBT.println("Dumping entire flash memory content:");
+    dumpFlashData(0, FLASH_TOTAL_SIZE);
+    
+    pauseWriting = false;
+    SerialBT.println("Resuming write operations from address 0x" + String(currentAddress, HEX));
+  }
   else if (command == "status") {
     SerialBT.println("Current write address: 0x" + String(currentAddress, HEX));
     SerialBT.println("Writing is " + String(pauseWriting ? "paused" : "active"));
@@ -278,6 +292,7 @@ void processCommand(String command) {
     SerialBT.println("Available commands:");
     SerialBT.println("  dump     - Dump last 5 pages of data before current write position");
     SerialBT.println("  dumpadd 0xADDRESS LENGTH - Dump specified bytes from address");
+    SerialBT.println("  dumpall  - Dump entire flash memory content");
     SerialBT.println("  status   - Show current write status");
     SerialBT.println("  erase    - Erase entire flash chip");
     SerialBT.println("  help     - Show this help message");
