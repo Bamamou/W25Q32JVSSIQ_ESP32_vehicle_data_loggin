@@ -1,556 +1,415 @@
-#include <Arduino.h>
 #include <SPI.h>
+#include <BluetoothSerial.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "BluetoothSerial.h"
 
+// Check if Bluetooth is available
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
 #error Bluetooth is not enabled! Please run `make menuconfig` to enable it
 #endif
 
+// Flash memory commands
+#define WRITE_ENABLE    0x06
+#define WRITE_DISABLE   0x04
+#define CHIP_ERASE      0xC7
+#define READ_STATUS     0x05
+#define READ_DATA       0x03
+#define PAGE_PROGRAM    0x02
+#define SECTOR_ERASE    0x20
+
+// Pin definitions
+#define SPI_CS_PIN      5
+#define SPI_MOSI_PIN    23
+#define SPI_MISO_PIN    19
+#define SPI_CLK_PIN     18
+
+// Flash memory constants
+#define FLASH_PAGE_SIZE 256
+#define FLASH_SECTOR_SIZE 4096
+#define FLASH_TOTAL_SIZE 4194304  // 32 Mbit = 4 MB
+
+// FreeRTOS task handles and synchronization objects
+TaskHandle_t writeTaskHandle;
+TaskHandle_t btTaskHandle;
+SemaphoreHandle_t flashMutex;
+
+// BluetoothSerial instance
 BluetoothSerial SerialBT;
 
-// SPI pins for W25Q32JVSSIQ
-const uint8_t pinHSPI_CS_Flash = 26;
-const uint8_t pinHSPI_MISO = 12;
-const uint8_t pinHSPI_CLK = 14;
-const uint8_t pinHSPI_MOSI = 13;
+// Global variables
+uint32_t currentAddress = 0;
+bool pauseWriting = false;
+uint8_t testData[FLASH_PAGE_SIZE];
 
-// Flash memory commands
-#define CMD_WRITE_ENABLE      0x06
-#define CMD_WRITE_DISABLE     0x04
-#define CMD_READ_STATUS       0x05
-#define CMD_WRITE_STATUS      0x01
-#define CMD_READ_DATA         0x03
-#define CMD_PAGE_PROGRAM      0x02
-#define CMD_ERASE_SECTOR      0x20
-#define CMD_ERASE_BLOCK_32K   0x52
-#define CMD_ERASE_BLOCK_64K   0xD8
-#define CMD_ERASE_CHIP        0xC7
-#define CMD_READ_ID           0x90
-
-// Flash memory specifications
-#define FLASH_PAGE_SIZE       256     // 256 bytes per page
-#define FLASH_SECTOR_SIZE     4096    // 4KB sector size
-#define FLASH_BLOCK_SIZE      65536   // 64KB block size
-#define FLASH_CHIP_SIZE       4194304 // 32Mbit = 4MB
-#define MAXPAGESIZE           256     // Max data size for one entry
-
-// Vehicle data structure
-struct VehicleData {
-  float odometerKm;
-  float tripKm;
-  float speedKmh;
-  bool isInReverseMode;
-  uint8_t ridingMode;
-  float busCurrent;
-  float bmsCurrent;
-  uint8_t vehicleStatusByte1;
-  uint8_t vehicleStatusByte2;
-  float throttle;
-  float controllerTemperature;
-  float motorTemperature;
-  float bmsVoltage;
-  float bmsCellHighestVoltageValue;
-  float bmsCellLowestVoltageValue;
-  uint8_t soc;
-  uint16_t rpm;
-  float boardSupplyVoltage;
-  float chargerVoltage;
-  float chargerCurrent;
-  uint8_t numActiveErrors;
-  uint16_t sumActiveErrors;
-  bool headlightHighBeam;
-  bool turnLeftSwitch;
-  bool turnRightSwitch;
-  bool modeButton;
-  bool kickstand;
-  bool killswitch;
-  bool key;
-  bool breakSwitch;
-};
-
-// FreeRTOS handles
-TaskHandle_t writeTaskHandle;
-TaskHandle_t readTaskHandle;
-TaskHandle_t btDumpTaskHandle;
-SemaphoreHandle_t spiMutex;
-
-// Operation modes
-volatile bool operationMode = true;      // true = write, false = read
-volatile bool btReadingAllData = false;  // Flag for reading all data over BT
-
-// Track write position for ring buffer implementation
-volatile uint32_t currentWriteAddress = 0;
-volatile uint32_t totalEntriesWritten = 0;
-volatile uint32_t lastSectorErased = 0xFFFFFFFF;
-
-// Flash memory functions
-void setupFlash() {
-  pinMode(pinHSPI_CS_Flash, OUTPUT);
-  digitalWrite(pinHSPI_CS_Flash, HIGH); // Deselect the flash chip
-  SPI.begin(pinHSPI_CLK, pinHSPI_MISO, pinHSPI_MOSI, pinHSPI_CS_Flash);
-  SPI.setFrequency(10000000); // Set SPI clock to 10MHz
-  SPI.setBitOrder(MSBFIRST);
-  SPI.setDataMode(SPI_MODE0);
-}
-
-// Wait for flash to finish processing
-void waitForFlashReady() {
-  digitalWrite(pinHSPI_CS_Flash, LOW);
-  SPI.transfer(CMD_READ_STATUS);
-  while (SPI.transfer(0) & 0x01) {
-    // Wait until BUSY flag is cleared
-  }
-  digitalWrite(pinHSPI_CS_Flash, HIGH);
-}
-
-// Enable writing to flash
-void writeEnable() {
-  digitalWrite(pinHSPI_CS_Flash, LOW);
-  SPI.transfer(CMD_WRITE_ENABLE);
-  digitalWrite(pinHSPI_CS_Flash, HIGH);
-}
-
-// Read flash ID
-uint32_t readFlashID() {
-  uint32_t id = 0;
-  digitalWrite(pinHSPI_CS_Flash, LOW);
-  SPI.transfer(CMD_READ_ID);
-  SPI.transfer(0x00); // Dummy byte
-  SPI.transfer(0x00); // Dummy byte
-  id |= SPI.transfer(0) << 16;
-  id |= SPI.transfer(0) << 8;
-  id |= SPI.transfer(0);
-  digitalWrite(pinHSPI_CS_Flash, HIGH);
-  return id;
-}
-
-// Erase a sector (4KB)
-void eraseSector(uint32_t sectorAddr) {
-  // Align the address to sector boundary
-  sectorAddr = sectorAddr & ~(FLASH_SECTOR_SIZE - 1);
-  
-  writeEnable();
-  digitalWrite(pinHSPI_CS_Flash, LOW);
-  SPI.transfer(CMD_ERASE_SECTOR);
-  SPI.transfer((sectorAddr >> 16) & 0xFF);
-  SPI.transfer((sectorAddr >> 8) & 0xFF);
-  SPI.transfer(sectorAddr & 0xFF);
-  digitalWrite(pinHSPI_CS_Flash, HIGH);
-  waitForFlashReady();
-  
-  lastSectorErased = sectorAddr;
-}
-
-// Write a page (up to 256 bytes)
-void writePage(uint32_t addr, uint8_t* data, uint16_t length) {
-  if (length > FLASH_PAGE_SIZE) {
-    length = FLASH_PAGE_SIZE;
-  }
-  
-  writeEnable();
-  digitalWrite(pinHSPI_CS_Flash, LOW);
-  SPI.transfer(CMD_PAGE_PROGRAM);
-  SPI.transfer((addr >> 16) & 0xFF);
-  SPI.transfer((addr >> 8) & 0xFF);
-  SPI.transfer(addr & 0xFF);
-  
-  for (uint16_t i = 0; i < length; i++) {
-    SPI.transfer(data[i]);
-  }
-  
-  digitalWrite(pinHSPI_CS_Flash, HIGH);
-  waitForFlashReady();
-}
-
-// Read data from flash
-void readData(uint32_t addr, uint8_t* data, uint16_t length) {
-  digitalWrite(pinHSPI_CS_Flash, LOW);
-  SPI.transfer(CMD_READ_DATA);
-  SPI.transfer((addr >> 16) & 0xFF);
-  SPI.transfer((addr >> 8) & 0xFF);
-  SPI.transfer(addr & 0xFF);
-  
-  for (uint16_t i = 0; i < length; i++) {
-    data[i] = SPI.transfer(0);
-  }
-  
-  digitalWrite(pinHSPI_CS_Flash, HIGH);
-}
-
-// Generate random vehicle data
-VehicleData generateRandomVehicleData() {
-  VehicleData data;
-  
-  data.odometerKm = random(0, 100000) / 10.0;
-  data.tripKm = random(0, 10000) / 10.0;
-  data.speedKmh = random(0, 1200) / 10.0;
-  data.isInReverseMode = random(0, 2);
-  data.ridingMode = random(0, 4);
-  data.busCurrent = random(-200, 1000) / 10.0;
-  data.bmsCurrent = random(-200, 1000) / 10.0;
-  data.vehicleStatusByte1 = random(0, 256);
-  data.vehicleStatusByte2 = random(0, 256);
-  data.throttle = random(0, 1000) / 10.0;
-  data.controllerTemperature = random(200, 850) / 10.0 - 20.0; // -20 to 65C
-  data.motorTemperature = random(200, 1000) / 10.0 - 20.0;     // -20 to 80C
-  data.bmsVoltage = random(480, 600) / 10.0;                   // 48V to 60V
-  data.bmsCellHighestVoltageValue = random(38, 42) / 10.0;     // 3.8V to 4.2V
-  data.bmsCellLowestVoltageValue = random(30, 42) / 10.0;      // 3.0V to 4.2V
-  data.soc = random(0, 101);                                   // 0-100%
-  data.rpm = random(0, 8000);
-  data.boardSupplyVoltage = random(110, 140) / 10.0;           // 11.0V to 14.0V
-  data.chargerVoltage = random(0, 630) / 10.0;                 // 0 to 63V
-  data.chargerCurrent = random(0, 100) / 10.0;                 // 0 to 10A
-  data.numActiveErrors = random(0, 10);
-  data.sumActiveErrors = random(0, 65535);
-  data.headlightHighBeam = random(0, 2);
-  data.turnLeftSwitch = random(0, 2);
-  data.turnRightSwitch = random(0, 2);
-  data.modeButton = random(0, 2);
-  data.kickstand = random(0, 2);
-  data.killswitch = random(0, 2);
-  data.key = random(0, 2);
-  data.breakSwitch = random(0, 2);
-  
-  return data;
-}
-
-// Convert vehicle data to CSV string
-String vehicleDataToCSV(const VehicleData& data) {
-  String datalog = ";";
-  datalog.concat(data.odometerKm);
-  datalog.concat(";");
-  datalog.concat(data.tripKm);
-  datalog.concat(";");
-  datalog.concat(data.speedKmh);
-  datalog.concat(";");
-  datalog.concat(data.isInReverseMode);
-  datalog.concat(";");
-  datalog.concat(data.ridingMode);
-  datalog.concat(";");
-  datalog.concat(data.busCurrent);
-  datalog.concat(";");
-  datalog.concat(data.bmsCurrent);
-  datalog.concat(";");
-  datalog.concat(data.vehicleStatusByte1);
-  datalog.concat(";");
-  datalog.concat(data.vehicleStatusByte2);
-  datalog.concat(";");
-  datalog.concat(data.throttle);
-  datalog.concat(";");
-  datalog.concat(data.controllerTemperature);
-  datalog.concat(";");
-  datalog.concat(data.motorTemperature);
-  datalog.concat(";");
-  datalog.concat(data.bmsVoltage);
-  datalog.concat(";");
-  datalog.concat(data.bmsCellHighestVoltageValue);
-  datalog.concat(";");
-  datalog.concat(data.bmsCellLowestVoltageValue);
-  datalog.concat(";");
-  datalog.concat(data.soc);
-  datalog.concat(";");
-  datalog.concat(data.rpm);
-  datalog.concat(";");
-  datalog.concat(data.boardSupplyVoltage);
-  datalog.concat(";");
-  datalog.concat(data.chargerVoltage);
-  datalog.concat(";");
-  datalog.concat(data.chargerCurrent);
-  datalog.concat(";");
-  datalog.concat(data.numActiveErrors);
-  datalog.concat(";");
-  datalog.concat(data.sumActiveErrors);
-  datalog.concat(";");
-  datalog.concat(data.headlightHighBeam);
-  datalog.concat(";");
-  datalog.concat(data.turnLeftSwitch);
-  datalog.concat(";");
-  datalog.concat(data.turnRightSwitch);
-  datalog.concat(";");
-  datalog.concat(data.modeButton);
-  datalog.concat(";");
-  datalog.concat(data.kickstand);
-  datalog.concat(";");
-  datalog.concat(data.killswitch);
-  datalog.concat(";");
-  datalog.concat(data.key);
-  datalog.concat(";");
-  datalog.concat(data.breakSwitch);
-  datalog.concat(";");
-  
-  // Pad the string to fill the page
-  for (int i = datalog.length(); i < MAXPAGESIZE-1; i++) {
-    datalog.concat(".");
-  }
-  
-  return datalog;
-}
-
-// Parse CSV data string back to readable format
-String parseCSVData(const String& csvData) {
-  String result = "";
-  int fieldIndex = 0;
-  int startPos = 0;
-  int endPos = 0;
-  
-  // Define field names for better readability
-  const char* fieldNames[] = {
-    "OdometerKm", "TripKm", "SpeedKmh", "InReverse", "RidingMode",
-    "BusCurrent", "BMSCurrent", "StatusByte1", "StatusByte2", "Throttle",
-    "ControllerTemp", "MotorTemp", "BMSVoltage", "HighestCellV", "LowestCellV",
-    "SOC", "RPM", "BoardVoltage", "ChargerV", "ChargerCurrent",
-    "ActiveErrors", "SumActiveErrors", "HighBeam", "TurnLeft", "TurnRight",
-    "ModeButton", "Kickstand", "Killswitch", "Key", "BreakSwitch"
-  };
-  
-  // Skip initial semicolon
-  startPos = 1;
-  
-  // Parse each field
-  while ((endPos = csvData.indexOf(';', startPos)) != -1 && fieldIndex < 30) {
-    String value = csvData.substring(startPos, endPos);
-    if (value.length() > 0 && value[0] != '.') {
-      result += fieldNames[fieldIndex];
-      result += ": ";
-      result += value;
-      result += "\n";
-    }
-    startPos = endPos + 1;
-    fieldIndex++;
-  }
-  
-  return result;
-}
-
-// Task to write data to flash
-void writeTask(void *parameter) {
-  char bufferWrite[MAXPAGESIZE];
-  
-  while (true) {
-    if (operationMode && !btReadingAllData) {  // Write mode and not reading BT data
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        // Check if we need to erase a sector before writing
-        uint32_t currentSector = currentWriteAddress & ~(FLASH_SECTOR_SIZE - 1);
-        if (currentSector != lastSectorErased) {
-          Serial.printf("Erasing sector at address 0x%06X\n", currentSector);
-          SerialBT.printf("Erasing sector at address 0x%06X\n", currentSector);
-          eraseSector(currentSector);
-        }
-        
-        // Generate random vehicle data
-        VehicleData vehicleData = generateRandomVehicleData();
-        
-        // Convert to CSV format
-        String datalog = vehicleDataToCSV(vehicleData);
-        datalog.toCharArray(bufferWrite, datalog.length() + 1);
-        
-        // Write the data
-        Serial.printf("Writing to address 0x%06X (Entry #%lu)\n", currentWriteAddress, totalEntriesWritten + 1);
-        writePage(currentWriteAddress, (uint8_t*)bufferWrite, MAXPAGESIZE);
-        
-        // Update address for next write (ring buffer style)
-        currentWriteAddress = (currentWriteAddress + FLASH_PAGE_SIZE) % FLASH_CHIP_SIZE;
-        totalEntriesWritten++;
-        
-        xSemaphoreGive(spiMutex);
-      }
-      vTaskDelay(pdMS_TO_TICKS(500));  // Write every 500ms
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(100));  // Check flag every 100ms
-    }
-  }
-}
-
-// Task to read data from flash
-void readTask(void *parameter) {
-  char bufferRead[MAXPAGESIZE];
-  uint32_t readAddress = 0;
-
-  while (true) {
-    if (!operationMode && !btReadingAllData) {  // Read mode and not BT reading
-      if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-        // Read the data
-        memset(bufferRead, 0, MAXPAGESIZE);
-        readData(readAddress, (uint8_t*)bufferRead, MAXPAGESIZE);
-        
-        // Convert to readable format and print
-        String csvData = String(bufferRead);
-        String parsedData = parseCSVData(csvData);
-        
-        Serial.printf("Data from address 0x%06X:\n", readAddress);
-        Serial.println(parsedData);
-        
-        // Update address for next read
-        readAddress = (readAddress + FLASH_PAGE_SIZE) % FLASH_CHIP_SIZE;
-        
-        xSemaphoreGive(spiMutex);
-      }
-      vTaskDelay(pdMS_TO_TICKS(2000));  // Read every 2 seconds
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(100));  // Check flag every 100ms
-    }
-  }
-}
-
-// Task to read all data from flash and send over BT
-void btDumpTask(void *parameter) {
-  char bufferRead[MAXPAGESIZE];
-  uint32_t address = 0;
-  uint32_t entriesRead = 0;
-  uint32_t maxEntries = totalEntriesWritten > 0 ? min(static_cast<int>(totalEntriesWritten), FLASH_CHIP_SIZE / FLASH_PAGE_SIZE) : 
-    FLASH_CHIP_SIZE / FLASH_PAGE_SIZE;
-  
-  SerialBT.println("\n==== STARTING VEHICLE DATA DUMP ====");
-  SerialBT.printf("Total entries written: %lu\n", totalEntriesWritten);
-  SerialBT.println("Reading all available data...\n");
-  
-  // If we've wrapped around, start reading from the oldest data
-  if (totalEntriesWritten > FLASH_CHIP_SIZE / FLASH_PAGE_SIZE) {
-    address = currentWriteAddress;
-  }
-  
-  while (entriesRead < maxEntries && btReadingAllData) {
-    if (xSemaphoreTake(spiMutex, portMAX_DELAY)) {
-      // Read the data
-      memset(bufferRead, 0, MAXPAGESIZE);
-      readData(address, (uint8_t*)bufferRead, MAXPAGESIZE);
-      
-      // Convert to readable format and print over BT
-      String csvData = String(bufferRead);
-      if (csvData.length() > 0 && csvData[0] == ';') {
-        String parsedData = parseCSVData(csvData);
-        
-        SerialBT.printf("Entry #%lu (Addr: 0x%06X):\n", entriesRead + 1, address);
-        SerialBT.println(parsedData);
-        SerialBT.println("----------------------------");
-      }
-      
-      // Update address for next read (ring buffer style)
-      address = (address + FLASH_PAGE_SIZE) % FLASH_CHIP_SIZE;
-      entriesRead++;
-      
-      xSemaphoreGive(spiMutex);
-    }
-    
-    // Check for BT commands to abort the dump
-    if (SerialBT.available() > 0) {
-      if (SerialBT.read() == '0') {
-        SerialBT.println("Aborting dump operation!");
-        break;
-      }
-    }
-    
-    vTaskDelay(pdMS_TO_TICKS(100));  // Small delay between reads
-  }
-  
-  SerialBT.println("==== VEHICLE DATA DUMP COMPLETE ====");
-  SerialBT.printf("Total entries read: %lu\n", entriesRead);
-  SerialBT.printf("Resuming write operations at address 0x%06X\n", currentWriteAddress);
-  
-  btReadingAllData = false;
-  vTaskDelete(NULL);  // Delete this task
-}
-
-void processSerialCommand() {
-  if (Serial.available() > 0) {
-    char cmd = Serial.read();
-    if (cmd == '1') {
-      operationMode = false;  // Switch to read mode
-      Serial.println("Mode changed to READ");
-    } else if (cmd == '0') {
-      operationMode = true;   // Switch to write mode
-      Serial.println("Mode changed to WRITE");
-    }
-  }
-}
-
-void processBTCommand() {
-  if (SerialBT.available() > 0) {
-    char cmd = SerialBT.read();
-    
-    if (cmd == '1' && !btReadingAllData) {
-      SerialBT.println("Received command to read all vehicle data");
-      // Stop writing operations
-      bool prevMode = operationMode;
-      operationMode = false;
-      btReadingAllData = true;
-      
-      // Create a task to read and print all data
-      xTaskCreatePinnedToCore(
-        btDumpTask,         // Task function
-        "btDumpTask",       // Name
-        8192,               // Stack size (bytes) - larger stack for BT operations
-        NULL,               // Parameters
-        2,                  // Priority (higher than read/write)
-        &btDumpTaskHandle,  // Task handle
-        0                   // Core
-      );
-      
-      // After BT dump completes, mode will revert to previous state
-      vTaskDelay(pdMS_TO_TICKS(50));  // Small delay to allow task to start
-    }
-  }
-}
+// Function prototypes
+void writeTask(void *parameter);
+void btTask(void *parameter);
+void flashWriteEnable();
+void flashWaitForReady();
+void flashEraseSector(uint32_t address);
+void flashEraseChip();
+void flashReadData(uint32_t address, uint8_t *buffer, int length);
+void flashWritePage(uint32_t address, uint8_t *data, int length);
+void dumpFlashData(uint32_t startAddress, uint32_t length);
+void processCommand(String command);
 
 void setup() {
+  // Initialize Serial for debugging (optional)
   Serial.begin(115200);
-  delay(1000);  // Give time for serial to initialize
   
-  // Initialize random seed
-  randomSeed(analogRead(0));
+  // Initialize SPI
+  SPI.begin(SPI_CLK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN, SPI_CS_PIN);
+  SPI.setFrequency(10000000); // 10 MHz
+  SPI.setDataMode(SPI_MODE0);
+  
+  // Configure CS pin as output
+  pinMode(SPI_CS_PIN, OUTPUT);
+  digitalWrite(SPI_CS_PIN, HIGH);
   
   // Initialize Bluetooth Serial
-  SerialBT.begin("ESP32_Vehicle_Logger");  // Bluetooth device name
-  delay(1000);  // Give BT time to initialize
+  SerialBT.begin("ESP32_Flash_Writer");
   
-  Serial.println("\nESP32 Vehicle Data Logger with W25Q32JVSSIQ Flash");
-  SerialBT.println("\nESP32 Vehicle Data Logger with W25Q32JVSSIQ Flash");
+  // Create mutex for flash access
+  flashMutex = xSemaphoreCreateMutex();
   
-  // Initialize SPI for flash
-  setupFlash();
+  // Initialize test data pattern
+  for (int i = 0; i < FLASH_PAGE_SIZE; i++) {
+    testData[i] = i % 256;
+  }
   
-  // Read and print the flash ID
-  uint32_t flashID = readFlashID();
-  Serial.printf("Flash ID: 0x%06X\n", flashID);
-  SerialBT.printf("Flash ID: 0x%06X\n", flashID);
-  
-  // Create mutex for SPI access
-  spiMutex = xSemaphoreCreateMutex();
-  
-  // Create tasks
+  // Create FreeRTOS tasks
   xTaskCreatePinnedToCore(
-    writeTask,        // Task function
-    "writeTask",      // Name
-    8192,             // Stack size (bytes)
-    NULL,             // Parameters
-    1,                // Priority
-    &writeTaskHandle, // Task handle
-    0                 // Core
+    writeTask,           // Task function
+    "WriteTask",         // Task name
+    4096,                // Stack size in words
+    NULL,                // Task parameters
+    1,                   // Priority (0 to 24, higher is higher priority)
+    &writeTaskHandle,    // Task handle
+    0                    // Core (0 or 1)
   );
   
   xTaskCreatePinnedToCore(
-    readTask,         // Task function
-    "readTask",       // Name
-    8192,             // Stack size (bytes)
-    NULL,             // Parameters
-    1,                // Priority
-    &readTaskHandle,  // Task handle
-    1                 // Core
+    btTask,              // Task function
+    "BTTask",            // Task name
+    4096,                // Stack size in words
+    NULL,                // Task parameters
+    2,                   // Priority (higher than write task)
+    &btTaskHandle,       // Task handle
+    1                    // Core (0 or 1)
   );
   
-  Serial.println("Vehicle data logging started");
-  Serial.println("Send '0' to start writing, '1' to start reading");
-  SerialBT.println("Vehicle data logging started");
-  SerialBT.println("Send '1' over BT to dump all logged vehicle data");
-  SerialBT.println("Send '0' over BT to abort dump operation");
+  Serial.println("System initialized. Auto writing will begin...");
 }
 
 void loop() {
-  processSerialCommand();
-  processBTCommand();
-  delay(50); // Small delay to reduce CPU usage
+  // Main loop is empty since we're using FreeRTOS tasks
+  delay(1000);
+}
+
+// Task to continuously write data to flash memory
+void writeTask(void *parameter) {
+  // Wait a brief moment before starting to allow system to stabilize
+  vTaskDelay(pdMS_TO_TICKS(2000));
+  
+  Serial.println("Write task started");
+  
+  while (true) {
+    if (!pauseWriting) {
+      if (xSemaphoreTake(flashMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // Check if we need to wrap around to start
+        if (currentAddress >= FLASH_TOTAL_SIZE) {
+          currentAddress = 0;
+          Serial.println("Reached end of flash memory, wrapping to beginning");
+        }
+        
+        // Check if we need to erase a sector (sectors are 4KB)
+        if (currentAddress % FLASH_SECTOR_SIZE == 0) {
+          Serial.printf("Erasing sector at address 0x%06X\n", currentAddress);
+          flashEraseSector(currentAddress);
+        }
+        
+        // Update test data to include address information
+        uint32_t pageAddr = currentAddress;
+        for (int i = 0; i < FLASH_PAGE_SIZE; i += 4) {
+          if (i + 3 < FLASH_PAGE_SIZE) {
+            // First 4 bytes contain the address
+            testData[i] = (pageAddr >> 24) & 0xFF;
+            testData[i+1] = (pageAddr >> 16) & 0xFF;
+            testData[i+2] = (pageAddr >> 8) & 0xFF;
+            testData[i+3] = pageAddr & 0xFF;
+          }
+          pageAddr += 4;
+        }
+        
+        // Write a page of data
+        Serial.printf("Writing page at address 0x%06X\n", currentAddress);
+        flashWritePage(currentAddress, testData, FLASH_PAGE_SIZE);
+        
+        // Move to next page
+        currentAddress += FLASH_PAGE_SIZE;
+        
+        xSemaphoreGive(flashMutex);
+      }
+      
+      // Small delay between write operations
+      vTaskDelay(pdMS_TO_TICKS(500));
+    } else {
+      // If writing is paused, just yield CPU
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+// Task to handle Bluetooth commands
+void btTask(void *parameter) {
+  String btCommand = "";
+  
+  while (true) {
+    if (SerialBT.available()) {
+      char c = SerialBT.read();
+      
+      if (c == '\n' || c == '\r') {
+        if (btCommand.length() > 0) {
+          Serial.printf("Received BT command: %s\n", btCommand.c_str());
+          processCommand(btCommand);
+          btCommand = "";
+        }
+      } else {
+        btCommand += c;
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(20)); // Small delay to prevent CPU hogging
+  }
+}
+
+// Process Bluetooth commands
+void processCommand(String command) {
+  command.trim();
+  command.toLowerCase();
+  
+  if (command == "dump") {
+    // Pause writing and dump a portion of flash memory
+    pauseWriting = true;
+    SerialBT.println("Pausing write operations and dumping data...");
+    
+    // Wait a moment to ensure write task is paused
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Dump some data near the current write position (last 5 pages)
+    uint32_t startAddr = (currentAddress >= 5*FLASH_PAGE_SIZE) ? 
+                          (currentAddress - 5*FLASH_PAGE_SIZE) : 0;
+    SerialBT.println("Dumping 5 pages of data:");
+    dumpFlashData(startAddr, 5 * FLASH_PAGE_SIZE);
+    
+    pauseWriting = false;
+    SerialBT.println("Resuming write operations from address 0x" + String(currentAddress, HEX));
+  }
+  else if (command == "status") {
+    SerialBT.println("Current write address: 0x" + String(currentAddress, HEX));
+    SerialBT.println("Writing is " + String(pauseWriting ? "paused" : "active"));
+    float percentUsed = (float)currentAddress / FLASH_TOTAL_SIZE * 100.0;
+    SerialBT.printf("Flash usage: %.2f%% (%d bytes out of %d)\n", 
+                    percentUsed, currentAddress, FLASH_TOTAL_SIZE);
+  }
+  else if (command == "erase") {
+    // Pause writing and erase the entire flash chip
+    pauseWriting = true;
+    SerialBT.println("Pausing write operations and erasing entire flash chip...");
+    
+    // Wait a moment to ensure write task is paused
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    if (xSemaphoreTake(flashMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+      flashEraseChip();
+      SerialBT.println("Chip erase complete.");
+      
+      // Reset the current address to start from the beginning
+      currentAddress = 0;
+      
+      xSemaphoreGive(flashMutex);
+    } else {
+      SerialBT.println("Error: Could not acquire mutex for chip erase");
+    }
+    
+    pauseWriting = false;
+    SerialBT.println("Resuming write operations from address 0x" + String(currentAddress, HEX));
+  }
+  else if (command.startsWith("dumpadd ")) {
+    // Format: "dumpadd 0x123456 1024" - dumps 1024 bytes starting from address 0x123456
+    pauseWriting = true;
+    String params = command.substring(8);
+    int spacePos = params.indexOf(' ');
+    
+    if (spacePos > 0) {
+      String addrStr = params.substring(0, spacePos);
+      String lenStr = params.substring(spacePos + 1);
+      
+      uint32_t addr = 0;
+      uint32_t len = 0;
+      
+      // Parse the address
+      if (addrStr.startsWith("0x")) {
+        addr = strtoul(addrStr.c_str(), NULL, 16);
+      } else {
+        addr = strtoul(addrStr.c_str(), NULL, 10);
+      }
+      
+      // Parse the length
+      len = strtoul(lenStr.c_str(), NULL, 10);
+      
+      // Limit length to avoid buffer overflows
+      if (len > 4096) {
+        len = 4096;
+        SerialBT.println("Warning: Limiting dump length to 4096 bytes");
+      }
+      
+      SerialBT.printf("Dumping %d bytes from address 0x%06X\n", len, addr);
+      dumpFlashData(addr, len);
+    } else {
+      SerialBT.println("Error: Invalid format. Use 'dumpadd 0xADDRESS LENGTH'");
+    }
+    
+    pauseWriting = false;
+    SerialBT.println("Resuming write operations");
+  }
+  else if (command == "help") {
+    SerialBT.println("Available commands:");
+    SerialBT.println("  dump     - Dump last 5 pages of data before current write position");
+    SerialBT.println("  dumpadd 0xADDRESS LENGTH - Dump specified bytes from address");
+    SerialBT.println("  status   - Show current write status");
+    SerialBT.println("  erase    - Erase entire flash chip");
+    SerialBT.println("  help     - Show this help message");
+  }
+  else {
+    SerialBT.println("Unknown command. Type 'help' for available commands");
+  }
+}
+
+// Dump flash memory data via Bluetooth
+void dumpFlashData(uint32_t startAddress, uint32_t length) {
+  if (xSemaphoreTake(flashMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+    uint8_t buffer[64]; // Use a smaller buffer for BT transmission
+    
+    for (uint32_t addr = startAddress; addr < startAddress + length; addr += sizeof(buffer)) {
+      uint32_t chunkSize = min((uint32_t)sizeof(buffer), startAddress + length - addr);
+      
+      flashReadData(addr, buffer, chunkSize);
+      
+      // Print address
+      SerialBT.printf("0x%06X: ", addr);
+      
+      // Print hex values
+      for (uint32_t i = 0; i < chunkSize; i++) {
+        SerialBT.printf("%02X ", buffer[i]);
+        
+        // Add a space every 8 bytes for readability
+        if ((i + 1) % 8 == 0 && i < chunkSize - 1) {
+          SerialBT.print(" ");
+        }
+      }
+      
+      // Print ASCII representation
+      SerialBT.print(" | ");
+      for (uint32_t i = 0; i < chunkSize; i++) {
+        char c = buffer[i];
+        if (c >= 32 && c <= 126) { // Printable ASCII
+          SerialBT.print(c);
+        } else {
+          SerialBT.print(".");
+        }
+      }
+      
+      SerialBT.println();
+      yield(); // Allow for BT processing
+    }
+    
+    xSemaphoreGive(flashMutex);
+  } else {
+    SerialBT.println("Error: Could not acquire mutex for flash read");
+  }
+}
+
+// --- Flash Memory Interface Functions ---
+
+void flashWriteEnable() {
+  digitalWrite(SPI_CS_PIN, LOW);
+  SPI.transfer(WRITE_ENABLE);
+  digitalWrite(SPI_CS_PIN, HIGH);
+  delayMicroseconds(10);
+}
+
+void flashWaitForReady() {
+  uint8_t status = 1;
+  
+  while (status & 0x01) {
+    digitalWrite(SPI_CS_PIN, LOW);
+    SPI.transfer(READ_STATUS);
+    status = SPI.transfer(0);
+    digitalWrite(SPI_CS_PIN, HIGH);
+    delayMicroseconds(10);
+  }
+}
+
+void flashEraseSector(uint32_t address) {
+  flashWriteEnable();
+  
+  digitalWrite(SPI_CS_PIN, LOW);
+  SPI.transfer(SECTOR_ERASE);
+  SPI.transfer((address >> 16) & 0xFF);  // Address byte 1
+  SPI.transfer((address >> 8) & 0xFF);   // Address byte 2
+  SPI.transfer(address & 0xFF);          // Address byte 3
+  digitalWrite(SPI_CS_PIN, HIGH);
+  
+  flashWaitForReady();
+}
+
+void flashEraseChip() {
+  SerialBT.println("Starting full chip erase. This may take several seconds...");
+  
+  flashWriteEnable();
+  
+  digitalWrite(SPI_CS_PIN, LOW);
+  SPI.transfer(CHIP_ERASE);
+  digitalWrite(SPI_CS_PIN, HIGH);
+  
+  // Chip erase can take a while, so we'll wait
+  Serial.println("Waiting for chip erase to complete...");
+  flashWaitForReady();
+  Serial.println("Chip erase completed.");
+}
+
+void flashReadData(uint32_t address, uint8_t *buffer, int length) {
+  digitalWrite(SPI_CS_PIN, LOW);
+  
+  SPI.transfer(READ_DATA);
+  SPI.transfer((address >> 16) & 0xFF);  // Address byte 1
+  SPI.transfer((address >> 8) & 0xFF);   // Address byte 2
+  SPI.transfer(address & 0xFF);          // Address byte 3
+  
+  for (int i = 0; i < length; i++) {
+    buffer[i] = SPI.transfer(0);
+  }
+  
+  digitalWrite(SPI_CS_PIN, HIGH);
+}
+
+void flashWritePage(uint32_t address, uint8_t *data, int length) {
+  flashWriteEnable();
+  
+  digitalWrite(SPI_CS_PIN, LOW);
+  
+  SPI.transfer(PAGE_PROGRAM);
+  SPI.transfer((address >> 16) & 0xFF);  // Address byte 1
+  SPI.transfer((address >> 8) & 0xFF);   // Address byte 2
+  SPI.transfer(address & 0xFF);          // Address byte 3
+  
+  for (int i = 0; i < length; i++) {
+    SPI.transfer(data[i]);
+  }
+  
+  digitalWrite(SPI_CS_PIN, HIGH);
+  
+  flashWaitForReady();
 }
